@@ -1,0 +1,1226 @@
+---
+title: "ML2_FinalProject_Classification"
+author: "Khon Hoang Nguyen & Dustin Pacholleck"
+date: "2023-01-02"
+output: html_document
+---
+
+```{r}
+#Load all necessary libraries
+library(tidyverse)
+library(caret)
+library(pROC)
+library(randomForest)
+library(ranger)
+library(here)
+library(xgboost)
+library(pROC)
+library(prediction)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(RColorBrewer)
+library(gbm)
+```
+
+I.  **Dataset introduction and cleaning**
+
+    1.  **Introduction**
+
+```{r}
+#Load dataset
+data = read.csv("Data/hotel_bookings.csv")
+```
+
+The dataset I am using for this exercise is about 'Hotel booking demand'. It is about hotel bookings in Portugal, the author of this dataset used it to predict the cancellation for bookings, which I am trying to do the same in this assignment.
+
+This dataset contains more than 10,000 bookings from two types of hotels: City hotels and resorts. The dependent variable is is_canceled which indicates whether people cancel the booking or not. I am going to introduce each variable below in the process of cleaning and discovery.
+
+2.  **Cleaning**
+
+```{r}
+#Check number of NAs
+colSums(is.na(data))
+```
+
+Because the number of NAs is minor to the size of the total data, I decided to omit all the NAs.
+
+```{r}
+#Clean dataset
+##Remove NAs
+data <- na.omit(data)
+```
+
+```{r}
+#1st investigation
+str(data)
+```
+
+From the first looks, I see that many variables should be categorical and currently they are characters. So, first step, I am converting them.
+
+```{r}
+#Convert variables
+##Convert categorical variables to factor
+cat_var <- c('hotel', 'arrival_date_month','meal', 'country','market_segment','distribution_channel','reserved_room_type','assigned_room_type', 'deposit_type','agent','company','customer_type','reservation_status','reservation_status_date')
+for (i in cat_var) {
+  data[,i] <- as.factor(data[,i])
+}
+```
+
+```{r}
+#2nd investigation
+str(data)
+```
+
+The first problem is that some variables have too many levels that can cause problem when using decision tree models because the maximum capacity that those models can process in R is 53 levels. Those variables are: - country - 178 levels: This variable indicates where people come from. For this, I plan to recode it to a new variable 'schengen' which indicate whether people come from a schengen country or not. My assumption is that within schegen, people need less paperwork to travel to Portugal, therefore, this factor can impact the cancellation rate. - agent - 334 levels: This variable indicates who proceed the booking. In the dataset, it uses code to mark those people, therefore, there is no ideas how to recode them. But, in the dataset we have another variable 'distribution_channel' which is a more general level of agent, I assume it is good enough to have that variable to replace agent. So, 'agent' will be removed. - company - 353 levels: This variable indicates which company proceed the booking, it is more general than agent but less general than 'distribution_channel', for this one, the same approach with agent will be applied here with the same reason. - reservation_status_date - 926 levels: This variable mark the time the status change in the system. Those status can be "Canceled", Check-out", "Don't show up". It happens after the booking is completed or canceled, therefore, it shouldn't have any impact on the prediction, therefore, it will be removed.
+
+Secondly, it is about the variable 'reservation_status', similar to 'reservation_status_date', it happens after the booking is completed or canceled. It can be considered as a more detailed version of the dependent variable 'is_canceled', therefore, it doesn't contribute to the prediction of 'is_canceled', so it will be removed too.
+
+Thirdly, there are two variables that might have connection to each other which are 'reserved_room_type' and 'assigned_room_type'. The former is the room type that the guests book and the latter is the room type that they are assigned. So, the assigned and resevered types can be different or similar. One variable "room_type_match" will be created with "Yes" if room reserved is similar to room assigned and "No" if not.
+
+```{r}
+#convert variables to string
+data$reserved_room_type <- as.character(data$reserved_room_type)
+data$assigned_room_type <- as.character(data$assigned_room_type)
+
+#Create room_type_match
+data$room_type_match <- ifelse(data$reserved_room_type == data$assigned_room_type, "Yes", "No")
+
+#Convert all back to factor
+data$reserved_room_type <- as.factor(data$reserved_room_type)
+data$assigned_room_type <- as.factor(data$assigned_room_type)
+data$room_type_match <- as.factor(data$room_type_match)
+```
+
+In addition, some logic check should be done, we have a variable 'is_repeated_guest' which indicates whether a guest is a new one or he/she used to book the hotel before. There are also variables 'previous_cancellations' indicates number of times they cancelled before and 'previous_bookings_not_canceled' shows number of times they didn't cancel before. So it will be wrong if some people are repeated guests but they have 0 in both 'previous_cancellations' and 'previous_bookings_not_canceled'. It will also be wrong if people are new guests but they have greater than 0 in either 'previous_cancellations' or 'previous_bookings_not_canceled'.
+
+```{r}
+#check number of people who are repeated guests but have 0 in both 'previous_cancellations' and 'previous_bookings_not_canceled'
+nrow(data[(data$previous_bookings_not_canceled == 0 & data$previous_cancellations == 0 & data$is_repeated_guest == 1),])
+```
+
+For those people, I will adjust the status in 'is_repeated_guest' to make it correct.
+
+```{r}
+#Change the statuses of people which are wrong in 'is_repeated_guest'
+data[((data$previous_bookings_not_canceled != 0 | data$previous_cancellations != 0) & data$is_repeated_guest == 0),'is_repeated_guest'] <- 1
+
+```
+
+After that, I am getting back to the 1st problem about the the variables with too many levels. I start with adding the 'schengen' variable. Before doing that, I realize that some countries in the main data are not coded with international standard so I changed it.
+
+```{r}
+#Change them back to str to edit them
+data$country <- as.character(data$country)
+
+#Change the code in country variables to make it match the international standard
+data["country"][data["country"] == "CN"] <- "CHN"
+data["country"][data["country"] == "TMP"] <- "TLS"
+
+#Change them back to factor
+data$country <- as.factor(data$country)
+```
+
+After that, I create a separate table indicating which countries are from Schengen and which are not.
+
+```{r}
+#Because some models cannot handle categorical predictors with more than 53 categories, it is necessary to remove/adjust some variables
+#Variable 'country' is recoded to whether a country belongs to schengen or not
+#Adding 'schengen' variable
+#Create new variable 'schengen' - Whether the country is in Schengen or not
+#The data file schengen.csv was created manually using the international country codes and the schengen member list
+schengen = read.csv2(file="Data/schengen.csv", header=TRUE, sep = ",")
+colnames(schengen)[1] <- 'country'
+data <- merge(schengen, data, by = 'country')
+data['schengen'][data['schengen'] == 1] <- "Yes"
+data['schengen'][data['schengen'] == 0] <- "No"
+data$schengen <- as.factor(data$schengen)
+```
+
+After that, I remove the variables as stating above, and check the data again.
+
+```{r}
+#Remove the categorical predictors that have more than 53 levels.
+data$country <- NULL
+data$agent <- NULL
+data$company <- NULL
+data$reservation_status_date <- NULL
+data$reservation_status <- NULL
+```
+
+```{r}
+#Check the data again
+str(data)
+```
+
+Then I do some slight changes, changing 1 & 0 to "Yes" & "No" for 'is_repeated_guest' and 'is_canceled'.
+
+```{r}
+#Change 1 & 0 to "Yes" & "No" for some variables
+data["is_repeated_guest"][data["is_repeated_guest"] == 1] <- "Yes"
+data["is_repeated_guest"][data["is_repeated_guest"] == 0] <- "No"
+data["is_canceled"][data["is_canceled"] == 1] <- "Yes"
+data["is_canceled"][data["is_canceled"] == 0] <- "No"
+
+#Change them to factor
+data$is_repeated_guest <- as.factor(data$is_repeated_guest)
+data$is_canceled <- as.factor(data$is_canceled)
+```
+
+Let see the distribution of the dependent variable.
+
+```{r}
+table(data$is_canceled)
+```
+
+II. **Data exploration**
+
+    In this section, I am going to check each variable and explain the variables which are not introduced above.
+
+    First, we split the data to train and test sets.To avoid the difference happening after each time splitting, we save the data and load it later.
+
+```{r eval=FALSE, include=TRUE}
+#Create test and train data
+set.seed(123456789)
+training_obs <- createDataPartition(data$is_canceled, 
+                                    p = 0.7, 
+                                    list = FALSE) 
+data.train <- data[training_obs,]
+data.test  <- data[-training_obs,]
+```
+
+```{r eval=FALSE, include=TRUE}
+# saving the object to the external file
+saveRDS(object = data.train,
+          file   = here("data", "data.train.rds"))
+saveRDS(object = data.test,
+          file   = here("data", "data.test.rds"))
+```
+
+```{r}
+data.train <- readRDS(here("data", "data.train.rds"))
+data.test <- readRDS(here("data", "data.test.rds"))
+```
+
+Now we check the distribution of "No" and "Yes" in the target variable.
+
+```{r}
+table(data.train$is_canceled)
+```
+
+The distribution is not balance.So we try to balance it.
+
+```{r}
+model1.formula <- is_canceled ~ .
+```
+
+```{r eval=FALSE, include=TRUE}
+data.train.balance <-
+  ROSE::ovun.sample(formula = model1.formula, 
+                    data = data.train,
+                    method = "both",
+                    p = 0.5, 
+                    N = length(training_obs),
+                    seed = 123)[["data"]]
+```
+
+```{r eval=FALSE, include=TRUE}
+# saving the object to the external file
+saveRDS(object = data.train.balance,
+          file   = here("data", "data.train.balance.rds"))
+```
+
+```{r}
+data.train.balance <- readRDS(here("data", "data.train.balance.rds"))
+```
+
+```{r}
+table(data.train.balance$is_canceled)
+```
+
+Now, it is better.
+
+For some models, they will need 1 and 0 instead of "Yes" and "No" so we create a variable for that purpose.
+
+```{r}
+#Convert from "Yes" to 1 and "No" to 0
+data.train.balance$is_canceled_1 <- (data.train.balance$is_canceled == "Yes") * 1
+data.test$is_canceled_1 <- (data.test$is_canceled == "Yes") * 1
+```
+
+Now, we will investigate the train data before balancing.
+
+-   hotel: Indicate whether the booking belong to a city hotel or resort hotel
+
+```{r}
+count1 <- table(data.train$is_canceled, data.train$hotel)
+barplot(count1, main="hotel", beside=TRUE, legend = rownames(count1))
+```
+
+It seems that the cancellations happen more in City Hotel.
+
+-   lead_time: Number of days that elapsed between the entering date of the booking into the PMS and the arrival date
+
+```{r}
+hist(data.train[data.train$is_canceled == "No","lead_time"],xlab='lead_time', main='lead_time chart, green is no cancellation, red is cancellation',col='green',breaks = 10)
+hist(data.train[data.train$is_canceled == "Yes","lead_time"],col='red',breaks = 10, add = TRUE)
+```
+
+In this histogram, it shows that the longer the lead_time, the more likely the booking is canceled.
+
+arrival_date_year: Year of arrival
+
+```{r}
+count30 <- table(data.train$is_canceled, data.train$arrival_date_year)
+barplot(count30, main="arrival_date_year", beside=TRUE, legend = rownames(count30))
+```
+
+arrival_date_month: Month of arrival
+
+```{r}
+count31 <- table(data.train$is_canceled, data.train$arrival_date_month)
+barplot(count31, main="arrival_date_month", beside=TRUE, legend = rownames(count31),horiz=FALSE, cex.names=0.5)
+```
+
+arrival_date_week_number: Week number of arrival
+
+```{r}
+ggplot(data = data.train, aes(x = arrival_date_week_number, color = is_canceled)) +
+  stat_count(geom = 'step', position = 'dodge')
+```
+
+stays_in_the_weekend_night: Number of weekend nights of the stay
+
+```{r}
+count21 <- table(data.train$is_canceled, data.train$stays_in_weekend_nights)
+barplot(count21, main='stays_in_weekend_nights', beside=TRUE, legend = rownames(count21))
+```
+
+Most of the observations have fewer than 2 weekend nights, there seems to be no difference between cancellation and non cancellation.
+
+stays_in_week_nights: Number of week nights (Monday to Friday) the guest stayed or booked to stay at the hotel
+
+```{r}
+count22 <- table(data.train$is_canceled, data.train$stays_in_week_nights)
+barplot(count22, main='stays_in_week_nights', beside=TRUE, legend = rownames(count22), cex.names=0.3)
+```
+
+For week nights, the most popular lengths of booking are 1, 2, and 3 week nights. 0 and 1 week nights have lower cancellation proportion than 2 and 3 week nights.
+
+adults: Number of adults
+
+```{r}
+count13 <- table(data.train$is_canceled, data.train$adults)
+barplot(count13, main="adults", beside=TRUE, legend = rownames(count13))
+```
+
+Most of the times, the size of booking is 2 adults. Apart from 1, 2, 3, other sizes almost never happen in the data.trainset. 2 adults is the size the has greatest cancellation rate.
+
+children: Number of children
+
+```{r}
+count14 <- table(data.train$is_canceled, data.train$children)
+barplot(count14, main='children', beside=TRUE, legend = rownames(count14))
+```
+
+Almost all bookings are without children. If there are children, it is like 1 or 2 children.
+
+babies: Number of babies
+
+```{r}
+count15 <- table(data.train$is_canceled, data.train$babies)
+barplot(count15, main='babies', beside=TRUE, legend = rownames(count15))
+```
+
+Almost no baby is recorded in the data.trainset. There are few bookings with 1 baby.
+
+meal: Type of meal booked. Categories are presented in standard hospitality meal packages. - BB: Bed & Breakfast - HB: Half Board (Breakfast and Dinner normally) - FB: Full Board (Breakfast, Lunch and Dinner) - SC: Self-catering, i.e. No meals are included
+
+```{r}
+count2 <- table(data.train$is_canceled, data.train$meal)
+barplot(count2, main="meal", beside=TRUE, legend = rownames(count2))
+```
+
+market_segment: Market segment designation
+
+```{r}
+count4 <- table(data.train$is_canceled, data.train$market_segment)
+barplot(count4, main="market_segment", beside=TRUE, cex.names=0.3)
+```
+
+Only market segment group has cancellation rate higher than non-cancellation rate.
+
+distribution_channel: Booking distribution channel
+
+```{r}
+count5 <- table(data.train$is_canceled, data.train$distribution_channel)
+barplot(count5, main="distribution_channel", beside=TRUE, legend = rownames(count5))
+```
+
+The term "TA" means "Travel Agents" and "TO" means "Tour Operators". TA/TO seems to have highest cancellation proportion.
+
+is_repeated_guest: Value indicating if the booking name was from a repeated guest or not
+
+```{r}
+count25 <- table(data.train$is_canceled, data.train$is_repeated_guest)
+barplot(count25, main="is_repeated_guest", beside=TRUE, legend = rownames(count25))
+```
+
+Most of people are new customers. But if they are repeated customers, it is more likely that they will cancel the booking.
+
+previous_cancellations: Number of previous bookings that were cancelled by the customer prior to the current booking
+
+```{r}
+count16 <- table(data.train$is_canceled, data.train$previous_cancellations)
+barplot(count16, main='previous_cancellations', beside=TRUE, legend = rownames(count16))
+```
+
+Most of the people do not have the mark in history with cancellation. If they do, they only did cancel once. However, it is obvious that if they cancel once, they tend to cancel again.
+
+previous_bookings_not_canceled: Number of previous bookings not cancelled by the customer prior to the current booking. Because there are vevy few people having previous_bookings_not_canceled \>= 4, I limit the graph at 3.
+
+```{r}
+count17 <- table(data.train[data.train$previous_bookings_not_canceled < 4,'is_canceled'], data.train[data.train$previous_bookings_not_canceled < 4,'previous_bookings_not_canceled'])
+barplot(count17, main='previous_bookings_not_canceled', beside=TRUE, legend = rownames(count17))
+```
+
+reserved_room_type: Code of room type reserved For reserved room type, there are many different types of room, but there is no clear note on the rule of room coding here. So it is not possible to say if A is better than B or vice versa.
+
+```{r}
+count6 <- table(data.train$is_canceled, data.train$reserved_room_type)
+barplot(count6, main="reserved_room_type", beside=TRUE, legend = rownames(count6))
+```
+
+assigned_room_type: Code for the type of room assigned to the booking
+
+```{r}
+count7 <- table(data.train$is_canceled, data.train$assigned_room_type)
+barplot(count7, main="assigned_room_type", beside=TRUE, legend = rownames(count7))
+```
+
+type_room_match: Whether the room assigned is similar as the room reserved or not.
+
+```{r}
+count32 <- table(data.train$is_canceled, data.train$room_type_match)
+barplot(count32, main="room_type_match", beside=TRUE, legend = rownames(count32))
+```
+
+From the graph, it seems that people who are not allocated as they reserved, they are less likely to cancel the booking. This seems strange, but it might be that the room they are allocated is better than the room they reserved.
+
+booking_changes: Number of changes/amendments made to the booking from the moment the booking was entered on the PMS
+
+```{r}
+count18 <- table(data.train$is_canceled, data.train$booking_changes)
+barplot(count18, main='booking_changes', beside=TRUE, legend = rownames(count18))
+```
+
+It seems that the more people change the booking, the smaller proportion of cancellation it is going to be.
+
+deposit_type: Indication on if the customer made a deposit to guarantee the booking
+
+```{r}
+count8 <- table(data.train$is_canceled, data.train$deposit_type)
+barplot(count8, main="deposit_type", beside=TRUE, legend = rownames(count8))
+```
+
+It is strange that non-refund deposit is the type that people cancel much more than not cancel.
+
+days_in_waiting_list: Number of days the booking was in the waiting list before it was confirmed to the customer
+
+```{r}
+count23 <- table(data.train$is_canceled, data.train$days_in_waiting_list)
+barplot(count23, main="days_in_waiting_list", beside=TRUE, legend = rownames(count23))
+```
+
+customer_type: Type of customers, how do they make the booking.
+
+```{r}
+count11 <- table(data.train$is_canceled, data.train$customer_type)
+barplot(count11, main="customer_type", beside=TRUE, legend = rownames(count11))
+```
+
+Contract - when the booking has an allotment or other type of contract associated to it Group -- when the booking is associated to a group Transient -- when the booking is not part of a group or contract, and is not associated to other transient booking Transient-party -- when the booking is transient, but is associated to at least other transient booking
+
+adr: Average Daily Rate as defined by dividing the sum of all lodging transactions by the total number of staying nights
+
+```{r}
+hist(data.train[data.train$is_canceled == "No","adr"],xlab='adr', main='adr chart, green is no cancellation, red is cancellation',col='green',breaks = 10)
+hist(data.train[data.train$is_canceled == "Yes","adr"],col='red',breaks = 10, add = TRUE)
+```
+
+It seems that the higher the adr is, the higher proportion of cancellation it is.
+
+required_car_parking_spaces: Number of car parking spaces required by the customer
+
+```{r}
+count19 <- table(data.train$is_canceled, data.train$required_car_parking_spaces)
+barplot(count19, main='required_car_parking_spaces', beside=TRUE, legend = rownames(count19))
+```
+
+People who require car parking spaces have very low percentage of cancellation.
+
+total_of_special_requests: Number of special requests made by the customer
+
+```{r}
+count20 <- table(data.train$is_canceled, data.train$total_of_special_requests)
+barplot(count20, main='total_of_special_requests', beside=TRUE, legend = rownames(count20))
+```
+
+People having special requests have much lower percentage of cancellation than who don't have any.
+
+III. **Modelling**
+
+<!-- -->
+
+1.  **Random forest**
+
+First, we create a model with all variables.
+
+```{r}
+model1.formula <- is_canceled ~ . - is_canceled_1
+model1.formula_01 <- is_canceled_1 ~ . - is_canceled
+```
+
+Then we prepare to do cross validation.
+
+```{r}
+ctrl_cv5 <- trainControl(method = "cv", 
+                         number =    5,
+                         classProbs = T)
+```
+
+For the first random forest model, we do not set any parameters, we use the default one.
+
+```{r eval=FALSE, include=TRUE}
+set.seed(123456789)
+data.rf1 <- randomForest(model1.formula, 
+                           data = data.train.balance)
+```
+
+```{r eval=FALSE, include=TRUE}
+saveRDS(data.rf1, file = here("output", "data.rf1.rds"))
+```
+
+```{r}
+data.rf1 <- readRDS(here("output", "data.rf1.rds"))
+```
+
+```{r}
+plot(data.rf1)
+```
+
+As the number of trees is higher, the OOB error is smaller, and converges to approx. 150 trees. So, going forward, instead of letting the ntree go to 500, we'll limit them at 150. And we have 27 predictors, we will try to optimize, tune mtry parameter in the range from 5 to 15 in this first action.
+
+```{r}
+#Let mtry range from 5 to 15
+parameters_rf <- expand.grid(mtry = 5:15)
+ctrl_oob <- trainControl(method = "oob", classProbs = TRUE)
+```
+
+We start to tune mtry, and fix ntree, nodesize for now.
+
+```{r eval=FALSE, include=TRUE}
+  set.seed(123456789)
+  data.rf2 <-
+    train(model1.formula,
+          data = data.train.balance,
+          method = "rf",
+          ntree = 150,
+          nodesize = 100,
+          tuneGrid = parameters_rf,
+          trControl = ctrl_oob,
+          importance = TRUE)
+
+```
+
+```{r eval=FALSE, include=TRUE}
+saveRDS(data.rf2, file = here("output", "data.rf2.rds"))
+```
+
+```{r}
+data.rf2 <- readRDS(here("output", "data.rf2.rds"))
+data.rf2
+```
+
+```{r}
+plot(data.rf2$results$mtry,
+     data.rf2$results$Accuracy, type = "b")
+```
+
+The optimal mtry is 15. Next, we are going to tune the min.node.size using the ranger package. Due to the new different package, the result of optimal mtry might vary a bit. And as observe in the previous graph, we doubt that the model can get better if we increase mtry more, so in this trial, we will tune mtry too in the range from 15 to 20.
+
+```{r}
+parameters_ranger <- 
+  expand.grid(mtry = 15:20,
+              # split rule
+              splitrule = "gini",
+              # minimum size of the terminal node
+              min.node.size = c(100, 250, 500))
+```
+
+```{r eval=FALSE, include=TRUE}
+data.rf3 <- 
+    train(model1.formula, 
+          data = data.train.balance, 
+          method = "ranger", 
+          num.trees = 150,
+          # impurity measure
+          importance = "impurity",
+          # parameters
+          tuneGrid = parameters_ranger, 
+          trControl = ctrl_cv5)
+
+```
+
+```{r eval=FALSE, include=TRUE}
+saveRDS(data.rf3, file = here("output", "data.rf3.rds"))
+```
+
+```{r}
+data.rf3 <- readRDS(here("output", "data.rf3.rds"))
+data.rf3
+```
+
+After this tuning process with the ranger package, the ideal parameter should be mtry = 20, min.node.size = 100.
+
+```{r}
+plot(data.rf3)
+```
+
+From the graph, it can be seen that the lower minimal node size dominates the higher ones. Next, we are going to see the comparison of the performances of the 3 random forest models we have built so far.
+
+```{r}
+source(here("funs", "getAccuracyAndGini.R"))
+(models_rf <- c("1","2","3"))
+```
+
+Firstly, we check on the train data set.
+
+```{r}
+sapply(paste0("data.rf", models_rf),
+       function(x) getAccuracyAndGini(model = get(x),
+                                      data = data.train.balance,
+                                      target_variable = "is_canceled",
+                                      predicted_class = "Yes")
+)
+```
+
+Then, we check on the test data set.
+
+```{r}
+sapply(paste0("data.rf", models_rf),
+       function(x) getAccuracyAndGini(model = get(x),
+                                      data = data.test,
+                                      target_variable = "is_canceled",
+                                      predicted_class = "Yes")
+)
+```
+
+Our first impression is that the number of the 1st model is the best, but it faces overfit problem, so it is not ideal. For model 2 and 3, it doesn't face the overfit issue, and model 3 is slightly better than model 2. So among 3 models, model 3 seems to be the best one. We will demonstrate now our conclusion on the graph.
+
+```{r}
+pred.train.rf1 <- predict(data.rf1, 
+                         data.train.balance, 
+                         type = "prob")[, "Yes"]
+ROC.train.rf1  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                     pred.train.rf1)
+pred.test.rf1  <- predict(data.rf1, 
+                         data.test, 
+                         type = "prob")[, "Yes"]
+ROC.test.rf1   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                     pred.test.rf1)
+
+pred.train.rf2 <- predict(data.rf2, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.rf2  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.rf2)
+pred.test.rf2  <- predict(data.rf2, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.rf2   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                      pred.test.rf2)
+
+pred.train.rf3 <- predict(data.rf3, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.rf3  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.rf3)
+pred.test.rf3  <- predict(data.rf3, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.rf3   <- roc(as.numeric(data.test$is_canceled  == "Yes"), 
+                      pred.test.rf3)
+
+#####
+list(
+  ROC.train.rf1   = ROC.train.rf1,
+  ROC.test.rf1    = ROC.test.rf1,
+  ROC.train.rf2  = ROC.train.rf2,
+  ROC.test.rf2   = ROC.test.rf2,
+  ROC.train.rf3  = ROC.train.rf3,
+  ROC.test.rf3   = ROC.test.rf3
+) %>%
+  pROC::ggroc(alpha = 0.5, linetype = 1, size = 1) + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey", 
+               linetype = "dashed") +
+  labs(title = paste0("Gini TEST: ",
+                      "rf1 = ", 
+                      round(100 * (2 * auc(ROC.test.rf1) - 1), 1), "%, ",
+                      "rf2 = ", 
+                      round(100 * (2 * auc(ROC.test.rf2) - 1), 1), "%, ",
+                      "rf3 = ", 
+                      round(100 * (2 * auc(ROC.test.rf3) - 1), 1), "%, "),
+       subtitle =  paste0("Gini TRAIN: ",
+                          "rf = ", 
+                          round(100 * (2 * auc(ROC.train.rf1) - 1), 1), "%, ",
+                          "rf2 = ", 
+                          round(100 * (2 * auc(ROC.train.rf2) - 1), 1), "%, ",
+                          "rf3 = ", 
+                          round(100 * (2 * auc(ROC.train.rf3) - 1), 1), "%, ")) +
+  theme_bw() + coord_fixed() +
+  scale_color_brewer(palette = "Paired")
+```
+
+When looking at the graph, it feels like model 3 is also quite overfitted. So it's arbitrary conclude which one is better between model 2 and model 3. We are still a bit inclined to model 3.
+
+Next, we would investigate quickly the importance of each predictor, we focus on model 3.
+
+```{r fig.align="center", echo = FALSE,fig.width = 14,fig.height = 14}
+source(here("funs", "getVarImpPlot4Ranger.R"))
+getVarImpPlot4Ranger(data.rf3$finalModel,
+                     sort = TRUE,
+                     main = "Importance of predictors")
+```
+
+From the chart above, the four most important predictors are: - Deposit type Non-refund - Time from the booking till arrival date - Number of special requests - Room allocated is the same as room reserved
+
+In common sense, those 4 characters above are important and all make sense. So, we believe nothing is strange with the model.
+
+2.  **GBM**
+
+    Secondly, we will try with GBM. In the first try, we set the parameters as: n.trees = 500, interaction.depth = 4 shrinkage = 0.01 We treat it as a control model, and later we will tune the parameters and compare versus this control model.
+
+```{r eval=FALSE, include=TRUE}
+
+set.seed(123456789)
+data.gbm <- 
+  gbm(model1.formula_01,
+      data = data.train.balance,
+      distribution = "bernoulli",
+      # total number of trees
+      n.trees = 500,
+      # number of variable interactions - actually depth of the trees
+      interaction.depth = 4,
+      # shrinkage parameter - speed (pace) of learning
+      shrinkage = 0.01,
+      verbose = FALSE)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save model
+data.gbm %>% saveRDS(here("output", "data.gbm.rds"))
+```
+
+```{r}
+#Load model
+data.gbm = readRDS(here("output", "data.gbm.rds"))
+```
+
+Then we predict the train data set and then test data set with this model.
+
+```{r}
+#Predict train data set
+data.pred.train.gbm <- predict(data.gbm,
+                                  data.train.balance, 
+                                  # type = "response" gives in this case 
+                                  # probability of success
+                                  type = "response",
+                                  # n.trees sets the number of trees
+                                  # which are used to generate the prediction
+                                  n.trees = 500)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save result
+data.pred.train.gbm %>% saveRDS(here("output", "data.pred.train.gbm.rds"))
+```
+
+```{r}
+#Load result
+data.pred.train.gbm = readRDS(here("output", "data.pred.train.gbm.rds"))
+```
+
+```{r}
+#Predict test data set
+data.pred.test.gbm <- predict(data.gbm,
+                                 data.test, 
+                                 type = "response",
+                                 n.trees = 500)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save result
+data.pred.test.gbm %>% saveRDS(here("output", "data.pred.test.gbm.rds"))
+```
+
+```{r}
+#Load result
+data.pred.test.gbm = readRDS(here("output", "data.pred.test.gbm.rds"))
+```
+
+Now, we will see how the model 1 performs.
+
+```{r}
+source(here("funs", "getAccuracyAndGini2.R"))
+```
+
+```{r}
+getAccuracyAndGini2(data = data.frame(is_canceled = data.train.balance$is_canceled,
+                                      pred = data.pred.train.gbm),
+                    predicted_probs = "pred",
+                    target_variable = "is_canceled")
+```
+
+```{r}
+getAccuracyAndGini2(data = data.frame(is_canceled = data.test$is_canceled,
+                                      pred = data.pred.test.gbm),
+                    predicted_probs = "pred",
+                    target_variable = "is_canceled")
+```
+
+The first impression about GBM versus model rf3 is that it is very consistent and almost no overfit effect is observed. But for now, the accuracy and Gini are not as good as model rf3.
+
+After that, we will try to tune the parameters to improve the model. We will tune 4 parameters at the same time. For interaction.depth and shrinkage, we tune 2 values each, for n.trees and n.minobsinnode, we tune 3 values each. There are going to be 36 combinations.
+
+```{r}
+parameters_gbm <- expand.grid(interaction.depth = c(2, 4),
+                             n.trees = c(100, 250, 500),
+                             shrinkage = c(0.01, 0.05), 
+                             n.minobsinnode = c(100, 250, 500))
+```
+
+```{r eval=FALSE, include=TRUE}
+  set.seed(123456789)
+  data.gbm2  <- train(model1.formula,
+                         data = data.train.balance,
+                         distribution = "bernoulli",
+                         method = "gbm",
+                         tuneGrid = parameters_gbm,
+                         trControl = ctrl_cv5,
+                         verbose = FALSE)
+  saveRDS(object = data.gbm2,
+          file   = here("output", "data.gbm2.rds"))
+```
+
+```{r}
+data.gbm2 = readRDS(here("output", "data.gbm2.rds"))
+data.gbm2
+```
+
+The best parameters are: - n.trees = 500 - interactoin.depth = 4 - shinkage = 0.05 - n.minobsinnode = 100
+
+Now, we run the model 2 on the train and test data.
+
+```{r eval=FALSE, include=TRUE}
+data.pred.train.gbm2 <- predict(data.gbm2,
+                                  data.train.balance,
+                                  type = "prob",
+                                  n.trees = 500)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save result
+data.pred.train.gbm2 %>% saveRDS(here("output", "data.pred.train.gbm2.rds"))
+```
+
+```{r}
+#Load result
+data.pred.train.gbm2 = readRDS(here("output", "data.pred.train.gbm2.rds"))
+```
+
+```{r eval=FALSE, include=TRUE}
+data.pred.test.gbm2 <- predict(data.gbm2,
+                                 data.test, 
+                                 type = "prob",
+                                 n.trees = 500)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save result
+data.pred.test.gbm2 %>% saveRDS(here("output", "data.pred.test.gbm2.rds"))
+```
+
+```{r}
+#Load result
+data.pred.test.gbm2 = readRDS(here("output", "data.pred.test.gbm2.rds"))
+```
+
+```{r}
+getAccuracyAndGini2(data = data.frame(is_canceled = data.train.balance$is_canceled,
+                                      pred = data.pred.train.gbm2[, "Yes"]),
+                    predicted_probs = "pred",
+                    target_variable = "is_canceled")
+```
+
+```{r}
+getAccuracyAndGini2(data = data.frame(is_canceled = data.test$is_canceled,
+                                      pred = data.pred.test.gbm2[, "Yes"]),
+                    predicted_probs = "pred",
+                    target_variable = "is_canceled")
+```
+
+Thanks to the tuning, the accuracy increased from \~72% in the first model to \~78% in the second model, the Gini increases from 80 to 82. The improvement will be shown clearer in the below graph.
+
+```{r}
+pred.train.gbm <- data.pred.train.gbm
+ROC.train.gbm  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                     pred.train.gbm)
+pred.test.gbm  <- data.pred.test.gbm
+ROC.test.gbm   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                     pred.test.gbm)
+
+pred.train.gbm2 <- data.pred.train.gbm2[, "Yes"]
+ROC.train.gbm2  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.gbm2)
+pred.test.gbm2  <- data.pred.test.gbm2[, "Yes"]
+ROC.test.gbm2   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                      pred.test.gbm2)
+
+#####
+list(
+  ROC.train.gbm  = ROC.train.gbm,
+  ROC.test.gbm   = ROC.test.gbm,
+  ROC.train.gbm2  = ROC.train.gbm2,
+  ROC.test.gbm2   = ROC.test.gbm2
+) %>%
+  pROC::ggroc(alpha = 0.5, linetype = 1, size = 1) + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey", 
+               linetype = "dashed") +
+  labs(title = paste0("Gini TEST: ",
+                      "gbm = ", 
+                      round(100 * (2 * auc(ROC.test.gbm) - 1), 1), "%, ",
+                      "gbm2 = ", 
+                      round(100 * (2 * auc(ROC.test.gbm2) - 1), 1), "%, "),
+       subtitle =  paste0("Gini TRAIN: ",
+                          "gbm = ", 
+                          round(100 * (2 * auc(ROC.train.gbm) - 1), 1), "%, ",
+                          "gbm2 = ", 
+                          round(100 * (2 * auc(ROC.train.gbm2) - 1), 1), "%, ")) +
+  theme_bw() + coord_fixed() +
+  scale_color_brewer(palette = "Paired")
+```
+
+In general, the accuracy of the better GBM model is still not as good as model rf3, but its strength is that GBM gives consistent result between train and test model which means there is almost no overfit effect. We now go to experiment building the last model, which is XGBoost.
+
+3.  **XGBoost**
+
+    As in XGBoost, there are more parameters than in GBM, so we change the approach a bit, from the first model, we start tuning the parameter nrounds, and we fix other parameters.
+
+```{r}
+parameters_xgb <- expand.grid(nrounds = seq(20, 80, 10),
+                             max_depth = 8,
+                             eta = 0.25, 
+                             gamma = 1,
+                             colsample_bytree = 0.2,
+                             min_child_weight = 150,
+                             subsample = 0.8)
+
+```
+
+```{r eval=FALSE, include=TRUE}
+set.seed(123456789)
+data.xgb <- train(model1.formula,
+                     data = data.train.balance,
+                     method = "xgbTree",
+                     trControl = ctrl_cv5,
+                     tuneGrid  = parameters_xgb)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save model
+data.xgb %>% saveRDS(here("output", "data.xgb.rds"))
+```
+
+```{r}
+#Load movel
+data.xgb <- readRDS(here("output", "data.xgb.rds"))
+data.xgb
+```
+
+For the first model, we lock nrounds at 80, now we're going to tune max_depth and min_child_weight.
+
+```{r}
+parameters_xgb2 <- expand.grid(nrounds = 80,
+                              max_depth = seq(5, 15, 2),
+                              eta = c(0.25), 
+                              gamma = 1,
+                              colsample_bytree = c(0.2),
+                              min_child_weight = seq(200, 1000, 200),
+                              subsample = 0.8)
+```
+
+```{r eval=FALSE, include=TRUE}
+data.xgb2 <- train(model1.formula,
+                      data = data.train.balance,
+                      method = "xgbTree",
+                      trControl = ctrl_cv5,
+                      tuneGrid  = parameters_xgb2)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save model
+data.xgb2 %>% saveRDS(here("output", "data.xgb2.rds"))
+```
+
+```{r}
+#Load model
+data.xgb2 <- readRDS(here("output", "data.xgb2.rds"))
+data.xgb2
+```
+
+For the 2nd model, we find the optimal max_depth as 15 and min_child_weight = 200. Next, we keep tuning the colsample_bytree and sub_sample at once.
+
+```{r}
+parameters_xgb3 <- expand.grid(nrounds = 80,
+                              max_depth = 15,
+                              eta = 0.25, 
+                              gamma = 1,
+                              colsample_bytree = seq(0.1, 0.8, 0.1),
+                              min_child_weight = 200,
+                              subsample = c(0.6, 0.7, 0.8, 0.9))
+```
+
+```{r eval=FALSE, include=TRUE}
+set.seed(123456789)
+data.xgb3 <- train(model1.formula,
+                      data = data.train.balance,
+                      method = "xgbTree",
+                      trControl = ctrl_cv5,
+                      tuneGrid  = parameters_xgb3)
+```
+
+```{r eval=FALSE, include=TRUE}
+data.xgb3 %>% saveRDS(here("output", "data.xgb3.rds"))
+```
+
+```{r}
+data.xgb3 <- readRDS(here("output", "data.xgb3.rds"))
+data.xgb3
+```
+
+The optimal values for colsample_bytree and sub_sample are 0.7 and 0.9 respectively.
+
+Next, we are going to tune gamma and eta at the same time.
+
+```{r}
+parameters_xgb4 <- expand.grid(nrounds = 80,
+                              max_depth = 15,
+                              eta = c(0.125, 0.25, 0.5), 
+                              gamma = c(0,1,2),
+                              colsample_bytree = 0.7,
+                              min_child_weight = 200,
+                              subsample = 0.9)
+```
+
+```{r eval=FALSE, include=TRUE}
+set.seed(123456789)
+data.xgb4 <- train(model1.formula,
+                      data = data.train.balance,
+                      method = "xgbTree",
+                      trControl = ctrl_cv5,
+                      tuneGrid  = parameters_xgb4)
+```
+
+```{r eval=FALSE, include=TRUE}
+#Save model
+data.xgb4 %>% saveRDS(here("output", "data.xgb4.rds"))
+```
+
+```{r}
+#Load model
+data.xgb4 <- readRDS(here("output", "data.xgb4.rds"))
+data.xgb4
+```
+
+The optimal values for eta and gamma would be 0.5 and 2 respectively.
+
+After running all 4 models, now we are going to check and compare their performances on both train and test data sets.
+
+```{r}
+source(here("funs", "getAccuracyAndGini.R"))
+(models <- c("", "2":"4"))
+```
+
+```{r}
+sapply(paste0("data.xgb", models),
+       function(x) getAccuracyAndGini(model = get(x),
+                                      data = data.train.balance,
+                                      target_variable = "is_canceled",
+                                      predicted_class = "Yes")
+)
+```
+
+```{r}
+sapply(paste0("data.xgb", models),
+       function(x) getAccuracyAndGini(model = get(x),
+                                      data = data.test,
+                                      target_variable = "is_canceled",
+                                      predicted_class = "Yes")
+)
+```
+
+When checking 4 model of XGBoost, model 3 seems to be the best in term of accuracy, it is less overfitted than model 4, and it is slightly better than model 2.
+
+It can be shown clearer in the graph below.
+
+```{r}
+pred.train.xgb <- predict(data.xgb, 
+                         data.train.balance, 
+                         type = "prob")[, "Yes"]
+ROC.train.xgb  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                     pred.train.xgb)
+pred.test.xgb <- predict(data.xgb, 
+                         data.test, 
+                         type = "prob")[, "Yes"]
+ROC.test.xgb   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                     pred.test.xgb)
+
+pred.train.xgb2 <- predict(data.xgb2, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.xgb2  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.xgb2)
+pred.test.xgb2  <- predict(data.xgb2, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.xgb2   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                      pred.test.xgb2)
+
+pred.train.xgb3 <- predict(data.xgb3, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.xgb3  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.xgb3)
+pred.test.xgb3  <- predict(data.xgb3, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.xgb3   <- roc(as.numeric(data.test$is_canceled  == "Yes"), 
+                      pred.test.xgb3)
+pred.train.xgb4 <- predict(data.xgb4, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.xgb4  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.xgb4)
+pred.test.xgb4 <- predict(data.xgb4, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.xgb4   <- roc(as.numeric(data.test$is_canceled  == "Yes"), 
+                      pred.test.xgb4)
+
+#####
+list(
+  ROC.train.xgb   = ROC.train.xgb,
+  ROC.test.xgb    = ROC.test.xgb,
+  ROC.train.xgb2  = ROC.train.xgb2,
+  ROC.test.xgb2   = ROC.test.xgb2,
+  ROC.train.xgb3  = ROC.train.xgb3,
+  ROC.test.xgb3   = ROC.test.xgb3,
+  ROC.train.xgb4  = ROC.train.xgb4,
+  ROC.test.xgb4   = ROC.test.xgb4
+) %>%
+  pROC::ggroc(alpha = 0.5, linetype = 1, size = 1) + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey", 
+               linetype = "dashed") +
+  labs(title = paste0("Gini TEST: ",
+                      "xgb = ", 
+                      round(100 * (2 * auc(ROC.test.xgb) - 1), 1), "%, ",
+                      "xgb2 = ", 
+                      round(100 * (2 * auc(ROC.test.xgb2) - 1), 1), "%, ",
+                      "xgb3 = ", 
+                      round(100 * (2 * auc(ROC.test.xgb3) - 1), 1), "%, ",
+		                   "xgb4 = ", 
+                      round(100 * (2 * auc(ROC.test.xgb4) - 1), 1), "%, "),
+       subtitle =  paste0("Gini TRAIN: ",
+                          "xgb = ", 
+                          round(100 * (2 * auc(ROC.train.xgb) - 1), 1), "%, ",
+                          "xgb2 = ", 
+                          round(100 * (2 * auc(ROC.train.xgb2) - 1), 1), "%, ",
+                          "xgb3 = ", 
+                          round(100 * (2 * auc(ROC.train.xgb3) - 1), 1), "%, ",
+			                    "xgb4 = ", 
+                          round(100 * (2 * auc(ROC.train.xgb4) - 1), 1), "%, ")) +
+  theme_bw() + coord_fixed() +
+  scale_color_brewer(palette = "Paired")
+```
+
+IV. **Summary and conclusion**
+
+We have experimented in 3 types of models, each type has its pros and cons. Random forest 3 give the highest score but it suffers from overfit. Gbm 2 is very consistent between train and test datasets so it seems to to avoid overfit the best. XGBoost 3 stand somewhere in between, it is better than Gbm in term of performance and not have overfit issue as Random Forest.
+
+Now, we have rf3, gbm2 and xgb3 shown on the graph.
+
+```{r}
+pred.train.rf3 <- predict(data.rf3, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.rf3  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.rf3)
+pred.test.rf3  <- predict(data.rf3, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.rf3   <- roc(as.numeric(data.test$is_canceled  == "Yes"), 
+                      pred.test.rf3)
+
+pred.train.gbm2 <- data.pred.train.gbm2[, "Yes"]
+ROC.train.gbm2  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.gbm2)
+pred.test.gbm2  <- data.pred.test.gbm2[, "Yes"]
+ROC.test.gbm2   <- roc(as.numeric(data.test$is_canceled == "Yes"), 
+                      pred.test.gbm2)
+
+pred.train.xgb3 <- predict(data.xgb3, 
+                          data.train.balance, 
+                          type = "prob")[, "Yes"]
+ROC.train.xgb3  <- roc(as.numeric(data.train.balance$is_canceled == "Yes"), 
+                      pred.train.xgb3)
+pred.test.xgb3  <- predict(data.xgb3, 
+                          data.test, 
+                          type = "prob")[, "Yes"]
+ROC.test.xgb3   <- roc(as.numeric(data.test$is_canceled  == "Yes"), 
+                      pred.test.xgb3)
+#####
+list(
+  ROC.train.rf3  = ROC.train.rf3,
+  ROC.test.rf3   = ROC.test.rf3,
+  ROC.train.gbm2  = ROC.train.gbm2,
+  ROC.test.gbm2   = ROC.test.gbm2,
+  ROC.train.xgb3  = ROC.train.xgb3,
+  ROC.test.xgb3   = ROC.test.xgb3
+) %>%
+  pROC::ggroc(alpha = 0.5, linetype = 1, size = 1) + 
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey", 
+               linetype = "dashed") +
+  labs(title = paste0("Gini TEST: ",
+                      "rf3 = ", 
+                      round(100 * (2 * auc(ROC.test.rf3) - 1), 1), "%, ",
+		      "gbm2 = ", 
+                      round(100 * (2 * auc(ROC.test.gbm2) - 1), 1), "%, ",
+                      "xgb3 = ", 
+                      round(100 * (2 * auc(ROC.test.xgb3) - 1), 1), "%, "),
+       subtitle =  paste0("Gini TRAIN: ",
+                          "rf3 = ", 
+                          round(100 * (2 * auc(ROC.train.rf3) - 1), 1), "%, ",
+		  	  "gbm2 = ", 
+                          round(100 * (2 * auc(ROC.train.gbm2) - 1), 1), "%, ",
+                          "xgb3 = ", 
+                          round(100 * (2 * auc(ROC.train.xgb3) - 1), 1), "%, ")) +
+  theme_bw() + coord_fixed() +
+  scale_color_brewer(palette = "Paired")
+```
+
+When putting 3 models head to head on a graph, xgb3 seems to be the optimal option. Second priority would be gbm2 and 3rd place is for rf3. Maybe, a room for improvement of this project is to ensemble those 3 models to get the most appropriate one. But this action is considered depending on the business requirement too.
